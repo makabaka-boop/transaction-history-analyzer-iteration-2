@@ -42,13 +42,20 @@ const (
 	maxOps  = 500
 )
 
-// ParseLog decodes a log from JSON and validates it:
-//   - 2..8 distinct, non-empty transaction ids;
-//   - 1..500 ops, each READ/WRITE/COMMIT/ABORT on a declared transaction;
-//   - READ and WRITE carry a key, COMMIT and ABORT must not;
-//   - every transaction has exactly one terminating COMMIT or ABORT and no
-//     operation of that transaction may appear after it.
+// ParseLog decodes and validates a complete log. Every declared transaction
+// must have exactly one terminator.
 func ParseLog(data []byte) (*Log, error) {
+	return parseLog(data, false)
+}
+
+// ParseLogPrefix decodes and validates a still-growing log prefix. Declared
+// transactions may remain unterminated, but duplicate terminators, operations
+// after termination, illegal fields and unknown JSON fields are still rejected.
+func ParseLogPrefix(data []byte) (*Log, error) {
+	return parseLog(data, true)
+}
+
+func parseLog(data []byte, prefix bool) (*Log, error) {
 	var l Log
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -68,7 +75,7 @@ func ParseLog(data []byte) (*Log, error) {
 		}
 		declared[t] = true
 	}
-	if len(l.Ops) == 0 {
+	if !prefix && len(l.Ops) == 0 {
 		return nil, fmt.Errorf("ops: log is empty")
 	}
 	if len(l.Ops) > maxOps {
@@ -100,9 +107,11 @@ func ParseLog(data []byte) (*Log, error) {
 			terminated[op.Txn] = op.Seq
 		}
 	}
-	for _, t := range l.Txns {
-		if _, ok := terminated[t]; !ok {
-			return nil, fmt.Errorf("transaction %q never terminates: exactly one COMMIT or ABORT is required", t)
+	if !prefix {
+		for _, t := range l.Txns {
+			if _, ok := terminated[t]; !ok {
+				return nil, fmt.Errorf("transaction %q never terminates: exactly one COMMIT or ABORT is required", t)
+			}
 		}
 	}
 	return &l, nil
@@ -155,9 +164,20 @@ type Violation struct {
 	Reason string `json:"reason"`
 }
 
-// PropResult is the verdict for one execution property.
+const (
+	propViolated       = "determined-violation"
+	propNotViolatedYet = "not-violated-yet"
+
+	serialCyclic     = "determined-cycle"
+	serialAcyclicYet = "acyclic-so-far"
+)
+
+// PropResult is the verdict for one execution property. Status is reported
+// only for prefixes: it distinguishes a determined violation from a property
+// that has merely not been violated yet.
 type PropResult struct {
 	OK        bool       `json:"ok"`
+	Status    string     `json:"status,omitempty"`
 	Violation *Violation `json:"violation,omitempty"`
 }
 
@@ -166,25 +186,180 @@ type PropResult struct {
 // acyclic, otherwise one real directed cycle.
 type SerialResult struct {
 	Acyclic bool     `json:"acyclic"`
+	Status  string   `json:"status,omitempty"`
 	Order   []string `json:"order,omitempty"`
 	Cycle   []string `json:"cycle,omitempty"`
 }
 
-// Report is the full audit output.
+// CommitAdmission says whether an active transaction could commit at the
+// current end of a prefix. An aborted read source remains a permanent blocker.
+type CommitAdmission struct {
+	Txn             string   `json:"txn"`
+	CanCommitNow    bool     `json:"canCommitNow"`
+	BlockingSources []string `json:"blockingSources"`
+}
+
+// Report is the full audit output. In prefix mode FinalState is omitted and
+// CommittedState names the same committed values for what has been seen so
+// far; the report is explicitly marked as a prefix and must not be read as a
+// verdict for a complete log.
 type Report struct {
-	OK              bool             `json:"ok"`
-	Transactions    []string         `json:"transactions"`
-	NumOps          int              `json:"numOps"`
-	Reads           []ReadFact       `json:"reads"`
-	Edges           []Edge           `json:"edges"`
-	Serializability SerialResult     `json:"serializability"`
-	Recoverable     PropResult       `json:"recoverable"`
-	Cascadeless     PropResult       `json:"cascadeless"`
-	Strict          PropResult       `json:"strict"`
-	FinalState      map[string]int64 `json:"finalState"`
+	OK               bool              `json:"ok"`
+	Prefix           bool              `json:"prefix,omitempty"`
+	Transactions     []string          `json:"transactions"`
+	NumOps           int               `json:"numOps"`
+	Reads            []ReadFact        `json:"reads"`
+	Edges            []Edge            `json:"edges"`
+	Serializability  SerialResult      `json:"serializability"`
+	Recoverable      PropResult        `json:"recoverable"`
+	Cascadeless      PropResult        `json:"cascadeless"`
+	Strict           PropResult        `json:"strict"`
+	FinalState       map[string]int64  `json:"finalState"`
+	CommittedState   map[string]int64  `json:"committedState,omitempty"`
+	CommitAdmissions []CommitAdmission `json:"commitAdmissions,omitempty"`
+}
+
+// MarshalJSON keeps complete reports byte-for-byte on the old field set
+// (including an empty "finalState": {}) while hiding that field in prefix
+// reports.
+func (r Report) MarshalJSON() ([]byte, error) {
+	type reportWire Report
+	if !r.Prefix {
+		return json.Marshal(reportWire(r))
+	}
+	type prefixWire struct {
+		*reportWire
+		FinalState     map[string]int64 `json:"finalState,omitempty"`
+		CommittedState map[string]int64 `json:"committedState"`
+	}
+	wire := reportWire(r)
+	return json.Marshal(prefixWire{
+		reportWire:     &wire,
+		CommittedState: wire.CommittedState,
+	})
 }
 
 // ---------- audit ----------
+
+// auditState is the single streaming state used by both complete-log and
+// prefix audits. This keeps parsing-time legality and audit-time history on
+// the same operation rules.
+type auditState struct {
+	committed map[string]int              // txn -> commit seq
+	aborted   map[string]int              // txn -> abort seq
+	lastWrite map[string]int              // key -> seq of latest WRITE
+	readsFrom map[string]map[string][]int // reader -> writer -> read seqs
+	reads     []ReadFact
+	recV      *Violation
+	casV      *Violation
+	strV      *Violation
+}
+
+func newAuditState(txnCount int) *auditState {
+	return &auditState{
+		committed: make(map[string]int, txnCount),
+		aborted:   make(map[string]int, txnCount),
+		lastWrite: make(map[string]int),
+		readsFrom: make(map[string]map[string][]int),
+	}
+}
+
+func (s *auditState) apply(l *Log, op *Op) {
+	switch op.Type {
+	case OpRead:
+		fact := ReadFact{Seq: op.Seq, Txn: op.Txn, Key: op.Key}
+		if ws, ok := s.lastWrite[op.Key]; ok {
+			w := &l.Ops[ws-1]
+			v := w.Value
+			fact.Value = &v
+			fact.Source = Source{Kind: "write", Seq: w.Seq, Txn: w.Txn, Value: &v}
+			if w.Txn != op.Txn {
+				if s.readsFrom[op.Txn] == nil {
+					s.readsFrom[op.Txn] = map[string][]int{}
+				}
+				s.readsFrom[op.Txn][w.Txn] = append(s.readsFrom[op.Txn][w.Txn], op.Seq)
+				if _, ok := s.committed[w.Txn]; !ok {
+					// The source write is uncommitted: its transaction is
+					// still active or already aborted (an abort does not
+					// cleanse the write).
+					if s.casV == nil {
+						s.casV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
+							Reason: fmt.Sprintf("reads uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
+					}
+					if s.strV == nil {
+						s.strV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
+							Reason: fmt.Sprintf("reads uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
+					}
+				}
+			}
+		} else {
+			fact.Source = Source{Kind: "initial"}
+		}
+		s.reads = append(s.reads, fact)
+	case OpWrite:
+		if ws, ok := s.lastWrite[op.Key]; ok {
+			w := &l.Ops[ws-1]
+			if w.Txn != op.Txn {
+				if _, ok := s.committed[w.Txn]; !ok && s.strV == nil {
+					s.strV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
+						Reason: fmt.Sprintf("overwrites uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
+				}
+			}
+		}
+		s.lastWrite[op.Key] = op.Seq
+	case OpCommit:
+		// Recoverable: every transaction this one has read from must
+		// already be committed. If a source aborted or is still active,
+		// committing now is the first recoverability violation.
+		if s.recV == nil {
+			for _, wt := range sortedReadSources(s.readsFrom[op.Txn]) {
+				if _, ok := s.committed[wt]; !ok {
+					s.recV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type,
+						Reason: fmt.Sprintf("commits before its source transaction %s (read at op %d) has committed", wt, s.readsFrom[op.Txn][wt][0])}
+					break
+				}
+			}
+		}
+		s.committed[op.Txn] = op.Seq
+	case OpAbort:
+		// Aborting is always safe for the aborting transaction itself;
+		// readers of its writes are caught at their own COMMIT.
+		s.aborted[op.Txn] = op.Seq
+	}
+}
+
+func sortedReadSources(m map[string][]int) []string {
+	out := make([]string, 0, len(m))
+	for t := range m {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func committedState(l *Log, committed map[string]int) map[string]int64 {
+	state := map[string]int64{}
+	for i := range l.Ops {
+		op := &l.Ops[i]
+		if op.Type == OpWrite {
+			if _, ok := committed[op.Txn]; ok {
+				state[op.Key] = op.Value
+			}
+		}
+	}
+	return state
+}
+
+func propResult(v *Violation) PropResult {
+	return PropResult{OK: v == nil, Violation: v}
+}
+
+func prefixPropResult(v *Violation) PropResult {
+	if v != nil {
+		return PropResult{OK: false, Status: propViolated, Violation: v}
+	}
+	return PropResult{OK: true, Status: propNotViolatedYet}
+}
 
 // Audit scans the log once in order and derives the full report.
 //
@@ -193,105 +368,100 @@ type Report struct {
 // transaction COMMITs, and an ABORT never erases a dirty read that already
 // happened.
 func Audit(l *Log) *Report {
+	s := newAuditState(len(l.Txns))
+	for i := range l.Ops {
+		s.apply(l, &l.Ops[i])
+	}
+
 	rep := &Report{
 		OK:           true,
 		Transactions: l.Txns,
 		NumOps:       len(l.Ops),
-		FinalState:   map[string]int64{},
+		Reads:        s.reads,
+		FinalState:   committedState(l, s.committed),
 	}
-
-	committed := make(map[string]int, len(l.Txns)) // txn -> commit seq
-	lastWrite := make(map[string]int)              // key -> seq of latest WRITE
-	readsFrom := make(map[string]map[string][]int) // reader -> writer -> read seqs
-	var recV, casV, strV *Violation
-
-	for i := range l.Ops {
-		op := &l.Ops[i]
-		switch op.Type {
-		case OpRead:
-			fact := ReadFact{Seq: op.Seq, Txn: op.Txn, Key: op.Key}
-			if ws, ok := lastWrite[op.Key]; ok {
-				w := &l.Ops[ws-1]
-				v := w.Value
-				fact.Value = &v
-				fact.Source = Source{Kind: "write", Seq: w.Seq, Txn: w.Txn, Value: &v}
-				if w.Txn != op.Txn {
-					if readsFrom[op.Txn] == nil {
-						readsFrom[op.Txn] = map[string][]int{}
-					}
-					readsFrom[op.Txn][w.Txn] = append(readsFrom[op.Txn][w.Txn], op.Seq)
-					if _, ok := committed[w.Txn]; !ok {
-						// The source write is uncommitted: its transaction is
-						// still active or already aborted (an abort does not
-						// cleanse the write).
-						if casV == nil {
-							casV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
-								Reason: fmt.Sprintf("reads uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
-						}
-						if strV == nil {
-							strV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
-								Reason: fmt.Sprintf("reads uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
-						}
-					}
-				}
-			} else {
-				fact.Source = Source{Kind: "initial"}
-			}
-			rep.Reads = append(rep.Reads, fact)
-		case OpWrite:
-			if ws, ok := lastWrite[op.Key]; ok {
-				w := &l.Ops[ws-1]
-				if w.Txn != op.Txn {
-					if _, ok := committed[w.Txn]; !ok && strV == nil {
-						strV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type, Key: op.Key,
-							Reason: fmt.Sprintf("overwrites uncommitted write of transaction %s (op %d)", w.Txn, w.Seq)}
-					}
-				}
-			}
-			lastWrite[op.Key] = op.Seq
-		case OpCommit:
-			// Recoverable: every transaction this one has read from must
-			// already be committed. If a source aborted or is still active,
-			// committing now is the first recoverability violation.
-			if recV == nil {
-				writers := make([]string, 0, len(readsFrom[op.Txn]))
-				for wt := range readsFrom[op.Txn] {
-					writers = append(writers, wt)
-				}
-				sort.Strings(writers)
-				for _, wt := range writers {
-					if _, ok := committed[wt]; !ok {
-						recV = &Violation{Seq: op.Seq, Txn: op.Txn, Op: op.Type,
-							Reason: fmt.Sprintf("commits before its source transaction %s (read at op %d) has committed", wt, readsFrom[op.Txn][wt][0])}
-						break
-					}
-				}
-			}
-			committed[op.Txn] = op.Seq
-		case OpAbort:
-			// Aborting is always safe for the aborting transaction itself;
-			// readers of its writes are caught at their own COMMIT.
-		}
-	}
-
 	rep.Edges = conflictEdges(l)
 	rep.Serializability = classify(l.Txns, rep.Edges)
-	rep.Recoverable = PropResult{OK: recV == nil, Violation: recV}
-	rep.Cascadeless = PropResult{OK: casV == nil, Violation: casV}
-	rep.Strict = PropResult{OK: strV == nil, Violation: strV}
+	rep.Recoverable = propResult(s.recV)
+	rep.Cascadeless = propResult(s.casV)
+	rep.Strict = propResult(s.strV)
+	return rep
+}
 
-	// Final committed state: writes of committed transactions, in log order.
-	// Shown for contrast only — it can look perfectly correct while the
-	// properties above are violated.
+// AuditPrefix audits a log prefix that may contain active transactions. A
+// prefix with all declared transactions already terminated has the same
+// verdict as Audit; otherwise its verdict is explicitly limited to the
+// operations observed so far.
+func AuditPrefix(l *Log) *Report {
+	if allTerminated(l) {
+		return Audit(l)
+	}
+
+	s := newAuditState(len(l.Txns))
 	for i := range l.Ops {
-		op := &l.Ops[i]
-		if op.Type == OpWrite {
-			if _, ok := committed[op.Txn]; ok {
-				rep.FinalState[op.Key] = op.Value
+		s.apply(l, &l.Ops[i])
+	}
+
+	rep := &Report{
+		OK:             s.recV == nil && s.casV == nil && s.strV == nil,
+		Prefix:         true,
+		Transactions:   l.Txns,
+		NumOps:         len(l.Ops),
+		Reads:          s.reads,
+		CommittedState: committedState(l, s.committed),
+	}
+	rep.Edges = conflictEdges(l)
+	rep.Serializability = classify(l.Txns, rep.Edges)
+	if rep.Serializability.Acyclic {
+		rep.Serializability.Status = serialAcyclicYet
+	} else {
+		rep.Serializability.Status = serialCyclic
+		rep.OK = false
+	}
+	rep.Recoverable = prefixPropResult(s.recV)
+	rep.Cascadeless = prefixPropResult(s.casV)
+	rep.Strict = prefixPropResult(s.strV)
+
+	active := make([]string, 0)
+	for _, t := range l.Txns {
+		if _, committed := s.committed[t]; !committed {
+			if _, aborted := s.aborted[t]; !aborted {
+				active = append(active, t)
 			}
 		}
 	}
+	sort.Strings(active)
+	rep.CommitAdmissions = make([]CommitAdmission, 0, len(active))
+	for _, t := range active {
+		blockers := make([]string, 0)
+		for _, source := range sortedReadSources(s.readsFrom[t]) {
+			if _, ok := s.committed[source]; !ok {
+				blockers = append(blockers, source)
+			}
+		}
+		rep.CommitAdmissions = append(rep.CommitAdmissions, CommitAdmission{
+			Txn:             t,
+			CanCommitNow:    len(blockers) == 0,
+			BlockingSources: blockers,
+		})
+	}
 	return rep
+}
+
+func allTerminated(l *Log) bool {
+	terminated := make(map[string]bool, len(l.Txns))
+	for i := range l.Ops {
+		op := &l.Ops[i]
+		if op.Type == OpCommit || op.Type == OpAbort {
+			terminated[op.Txn] = true
+		}
+	}
+	for _, t := range l.Txns {
+		if !terminated[t] {
+			return false
+		}
+	}
+	return true
 }
 
 // conflictEdges builds the directed conflict graph: for every ordered pair
