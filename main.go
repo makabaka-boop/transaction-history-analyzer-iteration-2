@@ -4,7 +4,13 @@
 //
 // Usage:
 //
-//	txcheck [log.json]     (reads stdin when no file is given)
+//	txcheck [--prefix] [log.json]     (reads stdin when no file is given)
+//
+// With --prefix the input is audited as a live prefix of a log still being
+// appended: declared transactions may be unterminated, violations already
+// observed are reported as established (properties without evidence only as
+// not yet violated), and each open transaction gets a commit-now
+// recoverability admission.
 //
 // The audit report is written to stdout as JSON. Input/validation errors
 // are reported as a JSON object on stderr with exit code 1.
@@ -18,23 +24,25 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 2 {
-		fmt.Fprintln(os.Stderr, "usage: txcheck [log.json]   (reads stdin when no file is given)")
+	prefix, file, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "usage: txcheck [--prefix] [log.json]   (reads stdin when no file is given)")
 		os.Exit(2)
 	}
-	var (
-		data []byte
-		err  error
-	)
-	if len(os.Args) == 2 {
-		data, err = os.ReadFile(os.Args[1])
+	var data []byte
+	if file != "" {
+		data, err = os.ReadFile(file)
 	} else {
 		data, err = io.ReadAll(os.Stdin)
 	}
 	if err != nil {
 		fail(err)
 	}
-	log, err := ParseLog(data)
+	parse := ParseLog
+	if prefix {
+		parse = ParseLogPrefix
+	}
+	log, err := parse(data)
 	if err != nil {
 		fail(err)
 	}
@@ -44,6 +52,22 @@ func main() {
 		fail(err)
 	}
 	fmt.Println(string(out))
+}
+
+// parseArgs separates the optional --prefix flag from the optional log file
+// argument; more than one file is a usage error.
+func parseArgs(args []string) (prefix bool, file string, err error) {
+	for _, a := range args {
+		if a == "--prefix" || a == "-prefix" {
+			prefix = true
+			continue
+		}
+		if file != "" {
+			return false, "", fmt.Errorf("at most one log file may be given, got %q and %q", file, a)
+		}
+		file = a
+	}
+	return prefix, file, nil
 }
 
 // fail reports err as a JSON object on stderr and exits non-zero.

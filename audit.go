@@ -34,6 +34,12 @@ type Op struct {
 type Log struct {
 	Txns []string `json:"transactions"`
 	Ops  []Op     `json:"ops"`
+
+	// prefix records how the log was parsed: true when it came from
+	// ParseLogPrefix, i.e. it may be a live prefix with declared
+	// transactions still unterminated. Audit uses it so a prefix can never
+	// be reported with the final verdicts of a complete log.
+	prefix bool
 }
 
 const (
@@ -42,13 +48,27 @@ const (
 	maxOps  = 500
 )
 
-// ParseLog decodes a log from JSON and validates it:
+// ParseLog decodes a complete log from JSON and validates it:
 //   - 2..8 distinct, non-empty transaction ids;
 //   - 1..500 ops, each READ/WRITE/COMMIT/ABORT on a declared transaction;
 //   - READ and WRITE carry a key, COMMIT and ABORT must not;
 //   - every transaction has exactly one terminating COMMIT or ABORT and no
 //     operation of that transaction may appear after it.
 func ParseLog(data []byte) (*Log, error) {
+	return parseLog(data, false)
+}
+
+// ParseLogPrefix decodes a live prefix of a log that is still being
+// appended. Every ParseLog rule applies except the last one: declared
+// transactions may still be unterminated. Duplicate termination, operations
+// after a terminator and malformed fields are rejected exactly as before.
+func ParseLogPrefix(data []byte) (*Log, error) {
+	return parseLog(data, true)
+}
+
+// parseLog is the single validation path behind ParseLog and ParseLogPrefix;
+// the prefix flag only relaxes the "every transaction terminates" rule.
+func parseLog(data []byte, prefix bool) (*Log, error) {
 	var l Log
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -100,11 +120,14 @@ func ParseLog(data []byte) (*Log, error) {
 			terminated[op.Txn] = op.Seq
 		}
 	}
-	for _, t := range l.Txns {
-		if _, ok := terminated[t]; !ok {
-			return nil, fmt.Errorf("transaction %q never terminates: exactly one COMMIT or ABORT is required", t)
+	if !prefix {
+		for _, t := range l.Txns {
+			if _, ok := terminated[t]; !ok {
+				return nil, fmt.Errorf("transaction %q never terminates: exactly one COMMIT or ABORT is required", t)
+			}
 		}
 	}
+	l.prefix = prefix
 	return &l, nil
 }
 
@@ -155,54 +178,174 @@ type Violation struct {
 	Reason string `json:"reason"`
 }
 
-// PropResult is the verdict for one execution property.
+// Prefix-mode labels. A violation or conflict cycle already observed in the
+// prefix is established: appending more operations can never make that
+// evidence go away. A property without evidence so far is only not yet
+// violated — never a final safety verdict for the growing log.
+const (
+	ModePrefix           = "prefix"
+	StatusEstablished    = "established"
+	StatusNotYetViolated = "notYetViolated"
+)
+
+// PropResult is the verdict for one execution property. A complete-log
+// report carries ok/violation; a prefix report carries a status of
+// StatusEstablished or StatusNotYetViolated instead of ok.
 type PropResult struct {
 	OK        bool       `json:"ok"`
+	Status    string     `json:"status,omitempty"`
 	Violation *Violation `json:"violation,omitempty"`
+}
+
+// MarshalJSON emits {"ok", "violation"?} for a complete-log report and
+// {"status", "violation"?} for a prefix report, so a prefix can never
+// masquerade as a final verdict.
+func (p PropResult) MarshalJSON() ([]byte, error) {
+	if p.Status != "" {
+		return json.Marshal(struct {
+			Status    string     `json:"status"`
+			Violation *Violation `json:"violation,omitempty"`
+		}{p.Status, p.Violation})
+	}
+	return json.Marshal(struct {
+		OK        bool       `json:"ok"`
+		Violation *Violation `json:"violation,omitempty"`
+	}{p.OK, p.Violation})
 }
 
 // SerialResult reports conflict serializability: the lexicographically
 // smallest serial order (ids compared bytewise) when the conflict graph is
-// acyclic, otherwise one real directed cycle.
+// acyclic, otherwise one real directed cycle. In a prefix report the
+// acyclic/order verdict is only "not yet violated" (a later op may still
+// close a cycle), while a cycle is established — edges only accumulate.
 type SerialResult struct {
 	Acyclic bool     `json:"acyclic"`
+	Status  string   `json:"status,omitempty"`
 	Order   []string `json:"order,omitempty"`
 	Cycle   []string `json:"cycle,omitempty"`
 }
 
-// Report is the full audit output.
+// MarshalJSON emits {"acyclic", "order"|"cycle"} for a complete-log report
+// and {"status", "order"|"cycle"} for a prefix report.
+func (s SerialResult) MarshalJSON() ([]byte, error) {
+	if s.Status != "" {
+		return json.Marshal(struct {
+			Status string   `json:"status"`
+			Order  []string `json:"order,omitempty"`
+			Cycle  []string `json:"cycle,omitempty"`
+		}{s.Status, s.Order, s.Cycle})
+	}
+	return json.Marshal(struct {
+		Acyclic bool     `json:"acyclic"`
+		Order   []string `json:"order,omitempty"`
+		Cycle   []string `json:"cycle,omitempty"`
+	}{s.Acyclic, s.Order, s.Cycle})
+}
+
+// CommitAdmission is the recoverability admission for issuing one COMMIT
+// for the transaction right now: admissible only when every transaction it
+// has read from is already committed. BlockedBy lists the blocking source
+// transactions — aborted or still active ones block alike — sorted by
+// transaction id.
+type CommitAdmission struct {
+	Admissible bool     `json:"admissible"`
+	BlockedBy  []string `json:"blockedBy"`
+}
+
+// OpenTransaction is a declared transaction still unterminated at the end of
+// a prefix, with its commit-now admission.
+type OpenTransaction struct {
+	Txn       string          `json:"txn"`
+	CommitNow CommitAdmission `json:"commitNow"`
+}
+
+// Report is the full audit output. In prefix mode (Mode == ModePrefix) the
+// per-property results and the serializability verdict carry statuses
+// instead of final booleans, FinalState is serialized as
+// "committedAsOfPrefix" (committed values as of the prefix, not a final
+// state), and OpenTransactions lists the unterminated transactions.
 type Report struct {
-	OK              bool             `json:"ok"`
-	Transactions    []string         `json:"transactions"`
-	NumOps          int              `json:"numOps"`
-	Reads           []ReadFact       `json:"reads"`
-	Edges           []Edge           `json:"edges"`
-	Serializability SerialResult     `json:"serializability"`
-	Recoverable     PropResult       `json:"recoverable"`
-	Cascadeless     PropResult       `json:"cascadeless"`
-	Strict          PropResult       `json:"strict"`
-	FinalState      map[string]int64 `json:"finalState"`
+	OK               bool              `json:"ok"`
+	Mode             string            `json:"mode,omitempty"`
+	Transactions     []string          `json:"transactions"`
+	NumOps           int               `json:"numOps"`
+	Reads            []ReadFact        `json:"reads"`
+	Edges            []Edge            `json:"edges"`
+	Serializability  SerialResult      `json:"serializability"`
+	Recoverable      PropResult        `json:"recoverable"`
+	Cascadeless      PropResult        `json:"cascadeless"`
+	Strict           PropResult        `json:"strict"`
+	FinalState       map[string]int64  `json:"finalState"`
+	OpenTransactions []OpenTransaction `json:"openTransactions,omitempty"`
+}
+
+// MarshalJSON keeps the complete-log field set byte-stable and emits the
+// prefix-only shape — "mode", "committedAsOfPrefix" instead of "finalState",
+// "openTransactions" — when Mode == ModePrefix.
+func (r Report) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		OK                  bool               `json:"ok"`
+		Mode                string             `json:"mode,omitempty"`
+		Transactions        []string           `json:"transactions"`
+		NumOps              int                `json:"numOps"`
+		Reads               []ReadFact         `json:"reads"`
+		Edges               []Edge             `json:"edges"`
+		Serializability     SerialResult       `json:"serializability"`
+		Recoverable         PropResult         `json:"recoverable"`
+		Cascadeless         PropResult         `json:"cascadeless"`
+		Strict              PropResult         `json:"strict"`
+		FinalState          *map[string]int64  `json:"finalState,omitempty"`
+		CommittedAsOfPrefix *map[string]int64  `json:"committedAsOfPrefix,omitempty"`
+		OpenTransactions    *[]OpenTransaction `json:"openTransactions,omitempty"`
+	}
+	w := wire{
+		OK: r.OK, Mode: r.Mode, Transactions: r.Transactions, NumOps: r.NumOps,
+		Reads: r.Reads, Edges: r.Edges, Serializability: r.Serializability,
+		Recoverable: r.Recoverable, Cascadeless: r.Cascadeless, Strict: r.Strict,
+	}
+	if r.Mode == ModePrefix {
+		w.CommittedAsOfPrefix = &r.FinalState
+		w.OpenTransactions = &r.OpenTransactions
+	} else {
+		w.FinalState = &r.FinalState
+	}
+	return json.Marshal(w)
 }
 
 // ---------- audit ----------
 
-// Audit scans the log once in order and derives the full report.
+// Audit scans the log once in order and derives the report. A log parsed by
+// ParseLogPrefix yields a prefix report: violations and conflict cycles
+// already observed are marked established, properties without evidence so
+// far are marked not yet violated (never a final safety verdict), each
+// unterminated transaction gets a commit-now recoverability admission, and
+// the committed state is reported as of the prefix only.
 //
 // The properties are judged purely by log position, never by the final
 // state: a write becomes visible to other transactions only when its
 // transaction COMMITs, and an ABORT never erases a dirty read that already
 // happened.
 func Audit(l *Log) *Report {
+	return audit(l, l.prefix)
+}
+
+// audit is the single scan behind Audit; prefix only changes how the
+// results are labeled, never how they are computed.
+func audit(l *Log, prefix bool) *Report {
 	rep := &Report{
 		OK:           true,
 		Transactions: l.Txns,
 		NumOps:       len(l.Ops),
 		FinalState:   map[string]int64{},
 	}
+	if prefix {
+		rep.Mode = ModePrefix
+	}
 
-	committed := make(map[string]int, len(l.Txns)) // txn -> commit seq
-	lastWrite := make(map[string]int)              // key -> seq of latest WRITE
-	readsFrom := make(map[string]map[string][]int) // reader -> writer -> read seqs
+	committed := make(map[string]int, len(l.Txns))  // txn -> commit seq
+	terminated := make(map[string]int, len(l.Txns)) // txn -> terminator seq
+	lastWrite := make(map[string]int)               // key -> seq of latest WRITE
+	readsFrom := make(map[string]map[string][]int)  // reader -> writer -> read seqs
 	var recV, casV, strV *Violation
 
 	for i := range l.Ops {
@@ -268,9 +411,11 @@ func Audit(l *Log) *Report {
 				}
 			}
 			committed[op.Txn] = op.Seq
+			terminated[op.Txn] = op.Seq
 		case OpAbort:
 			// Aborting is always safe for the aborting transaction itself;
 			// readers of its writes are caught at their own COMMIT.
+			terminated[op.Txn] = op.Seq
 		}
 	}
 
@@ -282,7 +427,8 @@ func Audit(l *Log) *Report {
 
 	// Final committed state: writes of committed transactions, in log order.
 	// Shown for contrast only — it can look perfectly correct while the
-	// properties above are violated.
+	// properties above are violated. In prefix mode it is only the committed
+	// state as of the prefix and is serialized as "committedAsOfPrefix".
 	for i := range l.Ops {
 		op := &l.Ops[i]
 		if op.Type == OpWrite {
@@ -291,7 +437,55 @@ func Audit(l *Log) *Report {
 			}
 		}
 	}
+
+	if prefix {
+		rep.Serializability.Status = StatusNotYetViolated
+		if !rep.Serializability.Acyclic {
+			rep.Serializability.Status = StatusEstablished
+		}
+		rep.Recoverable.Status = propStatus(recV)
+		rep.Cascadeless.Status = propStatus(casV)
+		rep.Strict.Status = propStatus(strV)
+		rep.OpenTransactions = openTransactions(l, terminated, committed, readsFrom)
+	}
 	return rep
+}
+
+// propStatus labels a property for a prefix report: established once its
+// first violation exists, otherwise only not yet violated.
+func propStatus(v *Violation) string {
+	if v != nil {
+		return StatusEstablished
+	}
+	return StatusNotYetViolated
+}
+
+// openTransactions lists every declared transaction still unterminated at
+// the end of the prefix, sorted by transaction id, each with its commit-now
+// recoverability admission: committing now is admissible only when every
+// transaction it has read from is already committed — a source that
+// aborted, or is still active, blocks.
+func openTransactions(l *Log, terminated, committed map[string]int, readsFrom map[string]map[string][]int) []OpenTransaction {
+	txns := append([]string{}, l.Txns...)
+	sort.Strings(txns)
+	out := []OpenTransaction{}
+	for _, t := range txns {
+		if _, ok := terminated[t]; ok {
+			continue
+		}
+		blocked := []string{}
+		for wt := range readsFrom[t] {
+			if _, ok := committed[wt]; !ok {
+				blocked = append(blocked, wt)
+			}
+		}
+		sort.Strings(blocked)
+		out = append(out, OpenTransaction{
+			Txn:       t,
+			CommitNow: CommitAdmission{Admissible: len(blocked) == 0, BlockedBy: blocked},
+		})
+	}
+	return out
 }
 
 // conflictEdges builds the directed conflict graph: for every ordered pair
